@@ -1,0 +1,1030 @@
+1.1	EGRESS QUEUE MANAGEMENT (EQM)
+Egress Queue Management (EQM)完成报文数据的缓存，基于输出队列的缓存管理和队列调度。芯片往外发往的每个报文，都需要进入EQM进行入队操作，缓存管理，然后通过调度器的调度，发往各个逻辑端口。
+1.1.1	Overview
+下图描述了EQM主要功能块。
+ 
+图表 1 EQM Block Diagram
+DQM：主要是完成报文的入队判决，报文外置缓存的搬移；
+QE  ： 主要完成状态队列链表，拓扑链接状态的维护；
+QS  ： 调度和shaping 控制模块，主要完成队列、调度器状态和调度器结果维护。
+DEQ ：出队处理模块，主要是完成FD的发送和队列资源计算。
+
+1.1.1.1	Data Queue Manager(DQM)
+DQM模块包括PBM、PDM两个子模块，完成报文的入队判决，内外置缓存的决策，报文数据的外置存储，多播报文的冗余权重的释放，队列缓存的计算，队列平均包长的计算等。
+ 
+图表 2 DQM Block Diagram
+1.1.1.1.1	 Packet Buffer Manager (PBM)
+PBM子模块从PE模块和EPS模块接收待入队报文信息，用于队列资源管理和入队判决处理。入队判决的流程如下：
+ 
+图表 3 EQ judge Flow Chart
+
+
+PBM子模块释放入队失败报文的PEB缓存，若报文入队成功，则刷新队列占用资源和队列平均包长。
+由于从PE、EPS收到的报文报文只有QID没有出端口号，需要在PBM模块向调度拓扑表项查询获得出端口，出端口号在计算队列平均包长时和内外置缓存决策时使用。由于QSL的表项访问时序已经占满，需要逻辑复制一张QSL表项。
+
+内外置缓存的选择
+
+自适应的动态选择内置或者外置的算法如下：
+出端口组的绑定关系见寄存器NNI_GP，ETH_GP，PIE_GP，PRBS_GP，WOE_GP。
+出端口组的水线配置见寄存器PORT0_GP_TH，PORT1_GP_TH，PORT2_GP_TH，PORT3_GP_TH，FREE_CNT_TH。
+具体的缓存选择功能如下：
+通过FAM送过来的4组出端口的IFB cell统计值，判断报文所属的出端口是否有足够的资源支持报文存放到IFB中，如果资源不足，则存放到EFB中；
+Jumbo帧固定走内置缓存，无足够的内置缓存时丢弃报文；
+出端口总共有4组，对应的优先级别从port0～port3递减，使用4个出端口IFB资源使用统计，port_cnt0~port_cnt3。
+各个出端口组的要求如下：
+对于port3要求：  port0_cnt+port1_cnt+port2_cnt+port3_cnt <=port3_gp_th才能走IFB通道；
+对于port2要求： port0_cnt+port1_cnt+port2_cnt <=port2_gp_th才能走IFB通道；
+对于port1要求： port0_cnt+port1_cnt <=*port1_gp_th才能走IFB通道；
+对于port0要求： port0_cnt <=port0_gp_th才能走IFB通道；
+
+DQM根据出端口egrb映射出对应的出端口组号，处理流程如下：
+ 
+图表 4 内外置缓存选择
+
+注：因为FAM统计EFB的空闲CELL数目是在建链之后才统计的，所以判断空闲CELL数目是否够存下当前包时需要考虑4个端口组队列里报文占用的CELL数目。
+IFB的空闲CELL统计可以在PBM进入三个端口组队列之前实时刷新，不用考虑三个端口组队列里报文占用的IFB CELL数目
+
+预留按端口组固定配置走内置或外置的功能。
+
+
+1.1.1.1.2	Packet Data Manager (PDM)
+ 
+图表 7 PDM 模块框图
+
+PDM模块从PBM接收入队判决成功的报文，根据出端口号送往相应的端口组队列，三个通道组队列不设反压，如果队列满则入队判决为丢弃。每个通道组队列深度为128（9600Byte * 3 * 8bit/18Gbps/10Mpps = 128pkt）。
+
+端口组出队时采用RR调度，不同端口之间IFB的报文和EFB的报文可以同时出队。同一个逻辑端口的报文需要保序，若前一个报文是EFB必须等报文的Write_end Bvld返回时才能让同一个逻辑端口的IFB的报文出队。
+当组播叶子判决为EFB缓存时，若body 指针表的Vld位无效则将报文从IFB读出搬到EFB，并将EFB Body地址基于MCID记录下来，置上EFB_VLD位。
+
+冗余权重释放流程：
+PQM统计多播叶子份数leaf_num，随last_leaf送到PE，PE透传给EQM，EQM根据Leaf_num释放IFB的冗余权重；
+PQM会把丢弃的多播叶子送给PE，PE透传到EQM，每份丢弃的非Last叶子释放单份权重。
+譬如PQM复制8份叶子，EQM丢弃了3份叶子，EPS转发5份叶子，last_leaf不丢弃，所有叶子都是IFB转发的情况, 权重的释放流程是：EQM丢弃的3份叶子逐份释放，EQM收到last_leaf时释放32-8=24份，EQM共释放了27份权重，剩下的5份由EPS逐份释放。
+
+譬如PQM复制8份叶子，EQM丢弃了3份叶子（其中1份是Last_leaf），EPS转发5份叶子，last_leaf丢弃，所有叶子都是IFB转发的情况, 权重的释放流程是：EQM丢弃的2份非last叶子逐份释放，EQM收到last_leaf时释放32-8+1=25份，EQM共释放了27份权重，剩下的5份由EPS逐份释放。
+
+当有多播叶子搬到EFB时，每份EFB叶子建链时，FAM会对EFB_WGT进行加1，IFB_WGT进行减1操作。IFB的冗余权重在EQM释放，EFB没有冗余权重的释放。EPS出包释放时，FAM根据地址判断是IFB还是EFB，逐份减MCID的IFB/EFB 的权重。IFB_WGT和EFB_WGT 同时为0才释放MCID和IFB/ EFB Body地址。释放MCID是通知EQM将EFB  body 地址表的EFB_VLD位置0。
+
+冗余权重记录表项结构如下表所示：
+多播Body EFB地址表：
+索引方式：MCID
+      Bit	Field	 Description
+21:17	ecc_chk	ECC校验域
+16	EFB_VLD	多播EFB Body 首CELL地址，当有叶子搬到EFB时记录为1， FAM释放MCID时通知EQM清0.
+15	Reserved 	保留。
+14：0	BODY_PTR	多播EFB Body 首CELL地址，当有叶子搬到EFB时记录
+  图表 8 EFB BODY地址表
+
+1.1.1.2	Queue Schedule(QS)
+该模块完成逻辑通道调度和物理端口调度，送出相应的FD出队请求给DEQ模块，完成出队报文Shaping令牌刷新。
+
+1.1.2	共享带宽设计方案
+1.1.2.1	场景
+共享带宽设计需要支持的目标：
+支持用户间的带宽保障
+支持用户业务间的带宽保障。
+支持用户间高优先级业务的带宽保证。
+
+场景1（多用户带宽保证）：
+总上行带宽20Mbps。
+如果只有用户A上网，则A独占20Mbps带宽。
+如果用户B加入，则A/B各分配最低5Mbps保证带宽，A优先级比B高，可以优先级占用10Mbps的保留带宽，A最高15Mbps最大带宽。
+如果A和B同时在线，则A/B各分配最低5Mbps保证带宽，则剩余的10Mbps带宽可以按比例分配给A和B。
+
+场景2（多业务带宽保证）：
+总上行带宽20Mbps。
+如果用户只有上网业务，则独享20Mbps带宽。
+如果用户有视频和上网业务，视频和上网各配置5Mbps的保证带宽，则视频优先级高可以分配到15Mbps带宽，上网分配5Mbps。
+如果用户有视频和上网业务，视频和上网各配置5Mbps的保证带宽，则剩余的10Mbps带宽可以按比例分配给视频和上网。
+
+场景3（多用户多业务带宽保证）：……
+用户A在玩即时游戏，用户B在做FTP下载。
+则用户A优先使用带宽，用户B低优先级使用带宽。
+
+带宽策略支持动态调整。
+   图表 9 调度拓扑
+
+QoS需要支持如上图所示的拓扑结构：用户业务队列，用户队列，和端口优先级队列。
+从外到内，
+	第一级为端口优先级队列，支持4/8个业务优先级。
+	第二级为用户队列。
+	第三级为用户业务队列，每个用户4/8个优先级队列。
+报文调度顺序：
+1.	报文首先被区分为用户和业务，进第三级队列。用户业务支持SP+WRR调度。
+2.	用户业务调度后，按照用户进第二级队列，用户队列。用户队列支持RR调度。用户支持限速。
+3.	用户队列调度后，按照业务优先级进第一级队列，端口优先级队列。端口优先级支持SP+WRR调度，端口支持限速。
+支持用户和业务流量统计。
+
+实现方案：
+	 
+	图表 10 共享带宽令牌
+A.保证带宽令牌桶：
+各种业务的保证令牌根据配置的xir配置的大小，按照固定的125us周期往令牌桶里添加令牌。如果业务流量少于保证带宽，令牌桶慢慢就会被填满，周期性添加令牌时就会有溢出，溢出部分的令牌就会被添加到共享令牌桶中。
+B.共带宽令牌桶：
+共享保证令牌桶根据配置的保留带宽配置的大小，按照固定的125us周期往令牌桶里添加令牌。如果各个保证带宽令牌有溢出，溢出部分的令牌会加上周期性添加的令牌一起添加到共享令牌桶中。
+
+	     
+调度:
+在有保证带宽令牌的情况下，优先使用保证带宽令牌桶里的令牌，消耗共享令牌阶段采用RR调度，确保各业务流的保证带宽能实施。
+
+在调度器各个输入的保证带宽都消耗完或队列空的情况下，根据保留带宽的分配策略来调度；若按照优先级来分配保留带宽则此阶段进行SP调度，若按照比例来分配保留带宽，则此阶段进行WRR调度。
+
+
+1.1.2.2	Queue Entity(QE)
+该模块完成实体队列的管理，如果时完成队列的建链操作，出队时完成队列链表的释放操作。该模块还完成队列各个状态的维护，发出队列到调度器的拓扑连接的请求。
+
+ 
+	图表 11 队列链表
+
+入队管理流程如下：
+1、	接收EQ送过来的一个帧描述符，根据描述符里报文首地址更新队列链表。
+2、	更新队列尾指针，更新队列链。
+3、	更新队列空状态和调度请求状态。
+
+调度出队流程如下：
+1、	查询队列链表，更新队头指针；
+2、	刷新队列空状态和调度请求状态。
+
+1.1.3	Interfaces
+EQM有如下接口:
+•	A:PE  EQM, PE把需要入队的FD信息送给EQM的接口。
+•	B:EPS  EQM, EPS把需要入队的环回FD信息送给EQM的接口。
+•	C:EQM  FAM, EQM申请缓存地址的接口以及释放缓存地址及冗余权重接口
+•	D:EQM  FAM, EFB CELL地址申请接口。
+•	E:EQM  MEMP, EQM向MEMP读报文数据接口。
+•	G:EQM  DMC, EQM向DMC写报文接口。
+•	H:EQM  EPS_PON,DBA上报接口。
+•	I:EQM  EPS, EQM给EPS报文出队的FD接口。
+•	J:EPS  EQM, EPS给EQM shaping 帧长补偿接口。
+•	K:EPS  EQM, EPS给EQM 精确CELL数目接口。
+1.1.3.1	EQM-EPS interface 
+EQM给EPS的FD可能有三种，需要EPS分别处理如下：
+正常需要发送的FD：在SYN有效及随后的三拍内发送。EPS需要正常读取数据。保持8拍的发送周期。前四拍有效，后四拍保留，但是数据无效。 
+EPS给EQM的反压：
+逻辑通道的反压。EPS会统计各个逻辑通道占用的出口缓存。如果超过阈值，则反压EQM。反压后，EQM最多会发送1~2个该逻辑通道的FD给EPS。
+EQM给EPS发送入队逻辑通道指示
+EQM会在入队的时候读取对应队列的逻辑通道号发送给EPS。
+
+1.1.4	References
+1.1.5	Data Structures
+EQM有如下的数据结构.
+1.1.5.1	QLL
+队列链表规格SD5182为38912*16bit，索引方式为队列资源指针。
+维护：由逻辑维护，CPU可读(作为调试辅助信息)。
+表1 队列链表QLL表数据结构
+      Bit	Field	 Description
+31:16	Rsv	保留
+15：0	next_addr	16bit
+1.1.5.2	QGS
+队列组资源占用统计表，表项规格为32*64，{group_num}。
+维护：由CPU只读，逻辑维护。（32x64）
+表2 队列组属性状态表QGS数据结构
+      Bit	Field	 Description
+长字0
+31:16	  Reserve	保留
+15:0	 occu_group_efb_pkt	队列组EFB占用共享缓存计数
+长字1
+31:16	Reserve	保留
+15:0	occu_group_efb_cell	队列组EFB占用共享缓存计数
+
+1.1.5.3	QRS
+队列请求更新Shaper的状态表 5610T索引方式为队列号【7:5】。前6个地址索引方式为[7:5](0-5,6-7地址为空)；地址8表示qrs_nempty_bmap[63:0],低6bit有效；表示QRS对应地址有无不空的队列，最后一个地址为qrs_need_bmap[63:0],低6bit有效；表示QRS对应地址有无不空且给反压的队列。5610H索引方式为队列号【6:5】，前4个地址为（0-3）；地址4表示qrs_nempty_bmap[63:0]，低4bit有效；地址五表示qrs_need_bmap[63:0]，低4bit有效；
+维护：逻辑统计，CPU只读。
+表3 队列请求状态表QRS数据结构
+      Bit	Field	 Description
+长字0
+31：0	q_shp_borr_st	各个队列是否需要更新SHAPER状态。
+0：不需要
+1：需要
+长字1
+31：0	q_nempty	各个队列是否空。
+0：空
+1：不空
+
+
+1.1.5.4	GSSS
+通用调度器调度状态表规格为32x128，索引方式为通用调度器编号。
+维护：由逻辑维护。
+
+表4 通用调度器调度状态表GSSS数据结构
+      Bit	Field	 Description
+长字0
+31:16	Shaper_ok	输入端SHAPER是否允许通过， bitmap对应16个输入端
+0：不允许通过
+1：允许通过
+15:0	sch_req	输入端是否有请求, bitmap对应16个输入端。
+0：无请求
+1：有请求
+长字1
+31：28	g7_rr_cnt	组drr调度计数器
+27：24	g6_rr_cnt	组drr调度计数器
+23：20	g5_rr_cnt	组drr调度计数器
+19：16	g4_rr_cnt	组drr调度计数器
+15：12	g3_rr_cnt	组drr调度计数器
+11：8	g2_rr_cnt	组drr调度计数器
+7：4	g1_rr_cnt	组drr调度计数器
+3：0	g0_rr_cnt	组drr调度计数器
+长字2
+31:30	g5_st_byte_low	组调度状态计数器，单位为64Byte
+29:24	g4_st_byte	组调度状态计数器，单位为64Byte
+23:18	g3_st_byte	组调度状态计数器，单位为64Byte
+17:12	g2_st_byte	组调度状态计数器，单位为64Byte
+11:6	g1_st_byte	组调度状态计数器，单位为64Byte
+5:0	g0_st_byte	组调度状态计数器，单位为64Byte
+长字3
+31:16	sch_dis	输入端是否禁止参与调度, bitmap对应16个输入端。
+0：无请求
+1：有请求
+15:10	g7_st_byte	组调度状态计数器，单位为64Byte
+9:4	g6_st_byte	组调度状态计数器，单位为64Byte
+3:0	g5_st_byte_high	组调度状态计数器，单位为64Byte
+1.1.5.5	GSSR
+通用调度器调度结果表规格为32*32，索引方式为通用调度器编号。
+维护：由逻辑维护，CPU可读(作为调试辅助信息)。
+表5 通用调度器调度结果表SSR数据结构
+      Bit	Field	 Description
+长字0
+31:21	Rsv	保留
+20	ssr_val	调度结果是否有效
+0:无效
+1:有效
+19	ssr_link	调度结果有没有连接到父调度器的输入端
+0:没有连接
+1:已经连接
+18：15	vp_num	调度结果为调度器的第几个输入端
+14	vp_type	表示调度结果是否为调度器的输出。
+0:调度结果为队列的输出；
+1:调度结果为调度器的输出。
+13:8	Rsv	保留
+7:0	vp_id	如果对应的是实体队列，q_num[7:0]表示256个实体队列号；
+如果对应的是子调度器的输出，则
+q_num[7:0]表示子调度器的ID；
+
+1.1.5.6	SCTH
+SHAPER令牌状态表，规格为32/4*4，索引方式如下：
+	通用调度器的SHAPER：索引为{通用调度器编号/4},每行存4个通用调度器的SHAPER配置及状态;
+维护：逻辑维护。
+表6 shaper令牌统计表STC数据结构
+      Bit	Field	 Description
+长字
+31:4	Rsv	保留
+3	Shp3_borr_st	当前shaper是否已经处于预借令牌状态（逻辑更新）
+2	Shp2_borr_st	当前shaper是否已经处于预借令牌状态（逻辑更新）
+1	Shp1_borr_st	当前shaper是否已经处于预借令牌状态（逻辑更新）
+0	shp0_borr_st	当前shaper是否已经处于预借令牌状态（逻辑更新）
+
+1.1.5.7	BPS 
+反压状态表，规格为1*32，索引方式如下：
+ Bit0-bit7  ： PON_CHANNEL0-15
+ Bit8      :  LOOPBACK 
+ Bit9      :  PRBS
+ Bit10     :  PIE（PIE4个逻辑通道共用一个）
+ Bit11-bit15:  ETH0-4
+ bit16     :  保留
+ Bit17-bit20:  PORT 端口调度状态 
+ Bit21-bit24:  PORT_SHAPER控制 
+维护：由逻辑维护，CPU可读(作为调试辅助信息)。
+表7 反压状态表BPS数据结构
+      Bit	Field	 Description
+长字0
+31:25	rsv	保留
+24:21	Port_shaper_ok	1:允许通过，1：不允许通过
+20:17	Port_sch_req	1:需要调度，0：不需要调度
+14:0	bp_st	对应逻辑通道17~0的反压状态（PIE4个逻辑通道共用一个）
+0:允许发送
+1:禁止发送
+
+
+1.1.5.8	PSSR
+端口调度器调度结果，表规格为27x32，索引方式为逻辑通道号。
+地址0-15 对应PON_CHANNEL0-15
+地址16 对应LOOPBACK
+地址17对应PRBS
+地址18-21对应PIE_CHANNEL0-3
+地址22-26对应ETH0-4
+
+维护：由逻辑维护，CPU可读(作为调试辅助信息)。
+
+表8 端口调度器调度结果表SSR数据结构
+      Bit	Field	 Description
+长字0
+31:7	rsv	保留
+6	PSSR_SP_VAL	当前结果是否有效
+5:0	SCH_ID	调度结果,链接该逻辑通道的通用调度器的编号
+
+1.1.5.9	QMS 
+队列属性模板选择，维护:由CPU维护，逻辑只读。
+表格名称	QMS Table
+起始地址	N/A
+地址范围	N/A
+表项数目	SD5182H: 256/16 = 16
+每项宽度	32bits×4Word
+寻址方式	索引方式为{队列号/16}，每行存16个队列的模板选择；
+ECC/PARITY	PARITY
+Table 1.1 1  QMS Table表基本描述
+
+Bit	Name	Description
+长字0
+31	q3_enq_en	队列入队使能 1: 入队0：不入队.
+逻辑初始化成0，队列不能入队，需要软件配置后队列才能入队。
+30:29	reserve	保留
+28:24	q3_mode	队列资源模板选择。
+23	q2_enq_en	队列入队使能 1: 入队0：不入队
+逻辑初始化成0，队列不能入队，需要软件配置后队列才能入队。
+22:21	reserve	                 保留
+20:16	q2_mode	队列资源模板选择。
+15	q1_enq_en	队列入队使能 1: 入队0：不入队.
+逻辑初始化成0，队列不能入队，需要软件配置后队列才能入队。
+14:13	reserve	                  保留
+12:8	q1_mode	队列资源模板选择。
+7	q0_enq_en	队列入队使能 1: 入队0：不入队.
+逻辑初始化成0，队列不能入队，需要软件配置后队列才能入队。
+6:5	reserve	保留
+4:0	q0_mode	队列资源模板选择。
+长字1
+31	q7_enq_en	队列入队使能 1: 入队0：不入队.
+逻辑初始化成0，队列不能入队，需要软件配置后队列才能入队。
+30:29	reserve	保留
+28:24	q7_mode	队列资源模板选择。
+23	q6_enq_en	队列入队使能 1: 入队0：不入队.
+逻辑初始化成0，队列不能入队，需要软件配置后队列才能入队。
+22:21	reserve	                 保留
+20:16	q6_mode	队列资源模板选择。
+15	q5_enq_en	队列入队使能 1: 入队 0：不入队.
+逻辑初始化成0，队列不能入队，需要软件配置后队列才能入队。
+14:13	reserve	                  保留
+12:8	q5_mode	队列资源模板选择。
+7	q4_enq_en	队列入队使能 1: 入队0：不入队.
+逻辑初始化成0，队列不能入队，需要软件配置后队列才能入队。
+6:5	reserve	保留
+4:0	q4_mode	队列资源模板选择。
+长字2
+31	q11_enq_en	队列入队使能 1: 入队0：不入队.
+逻辑初始化成0，队列不能入队，需要软件配置后队列才能入队。
+30:29	reserve	保留
+28:24	q11_mode	队列资源模板选择。
+23	q10_enq_en	队列入队使能 1: 入队0：不入队
+逻辑初始化成0，队列不能入队，需要软件配置后队列才能入队。
+22:21	reserve	                 保留
+20:16	q10_mode	队列资源模板选择。
+15	q9_enq_en	队列入队使能 1: 入队0：不入队
+逻辑初始化成0，队列不能入队，需要软件配置后队列才能入队。
+14:13	reserve	                  保留
+12:8	q9_mode	队列资源模板选择。
+7	q8_enq_en	队列入队使能 1: 入队0：不入队.
+逻辑初始化成0，队列不能入队，需要软件配置后队列才能入队。
+6:5	reserve	保留
+4:0	q8_mode	队列资源模板选择。
+长字3
+31	q15_enq_en	队列入队使能 1: 入队0：不入队.
+逻辑初始化成0，队列不能入队，需要软件配置后队列才能入队。
+30:29	reserve	保留
+28:24	q15_mode	队列资源模板选择。
+23	q14_enq_en	队列入队使能 1: 入队0：不入队
+逻辑初始化成0，队列不能入队，需要软件配置后队列才能入队。
+22:21	reserve	                 保留
+20:16	q14_mode	队列资源模板选择。
+15	q13_enq_en	队列入队使能 1: 入队0：不入队.
+逻辑初始化成0，队列不能入队，需要软件配置后队列才能入队。
+14:13	reserve	                  保留
+12:8	q13_mode	队列资源模板选择。
+7	q12_enq_en	队列入队使能 1: 入队0：不入队.
+逻辑初始化成0，队列不能入队，需要软件配置后队列才能入队。
+6:5	reserve	保留
+4:0	q12_mode	队列资源模板选择。
+		
+Table 1.1 2  QMS Table 数据结构
+
+1.1.5.10	QMC
+
+队列属性模板配置， 维护:由CPU维护，逻辑只读。
+ 
+表格名称	QMC Table
+起始地址	N/A
+地址范围	N/A
+表项数目	32
+每项宽度	32bits×6Word
+ECC/PARITY	PARITY
+寻址方式	索引方式为{队列属性板板号}，每行存1个模板配置；
+Table 1.1 3  QMC Table 表基本描述
+
+Bit	Field	Description
+长字0
+31	Drop_all	丢弃使能 1：丢弃，0：不丢弃
+30：28	tail_drop_mode	当发生尾丢弃后，队列深度小于一定阈值之后，才能继续接收报文，否则仍然作为尾丢弃处理。此阈值控制如下：
+3’b111：87.5%的尾丢弃阈值；
+3’b110：75%的尾丢弃阈值；
+ 3’b101：62.5%的尾丢弃阈值；
+3’b100：50%尾丢弃阈值；
+ 3’b011：37.5%的尾丢弃阈值；
+3’b010：25%的尾丢弃阈值；
+ 3’b001：12.5%的尾丢弃阈值；
+3’b000：100%尾丢弃阈值；
+27	Reserve	保留
+26:21	group_num1	队列的队列组1选择（相应端口组底下的优先权组）。
+20:16	group_num0【4:0】	队列的队列组0选择。（端口组号低5bit）
+15	  Group_num0[5]	队列的队列组0选择。（端口组号高1bit）
+14:13	reserve	保留
+12:0	q_ifb_max	队列尾丢弃阈值（5118保留）
+长字1
+31:29	reserve	保留
+ 28	qmc_vp_use	Qmc模板有效标志信号（软件用来判断模板是否已经被占用，逻辑不使用这个bit）
+27:26	reserve	保留
+ 25:17	q_ifb_private	队列独享空间深度(保留)
+16:13	reserve	保留
+12:0	q_ifb_cong	队列拥塞门限(保留)
+长字2
+31:16	reserve	保留
+15:0	q_efb_max	队列尾丢弃阈值
+长字3
+31:29	Reserve	保留
+28:20	q_efb_private	队列独享空间深度（CELL_PKT）
+19:16	Reserve	保留
+15:0	q_efb_cong	队列拥塞门限(CELL_PKT)
+                                   长字4
+  31:16	q_16b_cong	队列拥塞门限(16B)（低16bit）
+  15:14	reserve	保留
+13:0	q_16b_private	队列独享空间（16BYTE）
+                                 长字5
+31:30	reserve	                保留
+ 29:8	q_16b_max	      队列的最大深度（16B）
+7:6	reserve	保留
+5:0	q_16b_cong	队列拥塞门限(16B)(高6bit)
+Table 1.1 4  QMC Table 数据结构
+1.1.5.11	WRED 
+WRED模板配置，表项规格为16x128，每个地址存两个模板，共32个模板。维护:由CPU维护，逻辑只读。如果选择模板0，则不根据WRED进行丢弃。
+表格名称	WRED Table
+起始地址	N/A
+地址范围	N/A
+表项数目	16
+每项宽度	32bits×4Word
+ECC/PARITY	PARITY
+寻址方式	索引方式为{WRED模板号/2}，每行存2个WRED丢弃模板,共32个模板。
+Table 1.1 5  WRED Table 基本描述
+
+      Bit	Field	 Description
+长字0
+  31:24	   wred0_drop_p1	wred丢弃概率1。该值为丢弃概率256xp。
+例如若丢弃概率为25%，则配置为256x25%=0x40。
+  23:16	  wred0_drop_thr1	wred丢弃阈值1，占队列尾丢弃阈值的百分比256xp
+  15:8	   wred0_drop_p0	wred丢弃概率0。该值为丢弃概率256xp。
+例如若丢弃概率为25%，则配置为256x25%=0x40。
+  7:0	  wred0_drop_thr0	wred丢弃阈值0，占队列尾丢弃阈值的百分比256xp
+例如若超过尾丢弃阈值的20%，则配置为256x20%=0x33。
+长字1
+  31:24	   wred0_drop_p3	wred丢弃概率3。该值为丢弃概率256xp。
+例如若丢弃概率为25%，则配置为256x25%=0x40。
+  23:16	  wred0_drop_thr3	wred丢弃阈值3，占队列尾丢弃阈值的百分比256xp
+  15:8	   wred0_drop_p2	wred丢弃概率2。该值为丢弃概率256xp。
+例如若丢弃概率为25%，则配置为256x25%=0x40。
+    7:0	  wred0_drop_thr2	wred丢弃阈值2，占队列尾丢弃阈值的百分比256xp
+长字2
+   31:24	   wred1_drop_p1	wred丢弃概率1。该值为丢弃概率256xp。
+例如若丢弃概率为25%，则配置为256x25%=0x40。
+   23:16	  wred1_drop_thr1	wred丢弃阈值1，占队列尾丢弃阈值的百分比256xp
+   15:8	   wred1_drop_p0	wred丢弃概率0。该值为丢弃概率256xp。
+例如若丢弃概率为25%，则配置为256x25%=0x40。
+   7:0	  wred1_drop_thr0	wred丢弃阈值0，占队列尾丢弃阈值的百分比256xp
+例如若超过尾丢弃阈值的20%，则配置为256x20%=0x33。
+长字3
+  31:24	   wred1_drop_p3	wred丢弃概率3。该值为丢弃概率256xp。
+例如若丢弃概率为25%，则配置为256x25%=0x40。
+  23:16	  wred1_drop_thr3	wred丢弃阈值3，占队列尾丢弃阈值的百分比256xp
+  15:8	   wred1_drop_p2	wred丢弃概率2。该值为丢弃概率256xp。
+例如若丢弃概率为25%，则配置为256x25%=0x40。
+   7:0	  wred1_drop_thr2	wred丢弃阈值2，占队列尾丢弃阈值的百分比256xp
+Table 1.1 6  WRED Table 数据结构
+
+1.1.5.12	QGA
+队列组属性表，表项规格为32*192，维护:由CPU维护，逻辑只读。
+QGA Table Specification
+表格名称	QGA Table
+起始地址	N/A
+地址范围	N/A
+表项数目	                                                 32
+每项宽度	32×6Word
+寻址方式	索引方式为{group_num}
+ECC/PARITY	N/A
+Table 1.1 7  QGA Table表基本描述
+
+QGA Table Structure
+	
+Bit	Field	Description
+长字0
+31:29	reserved	保留
+28:16	group_ifb_max	队列组IFB最大可用共享缓存资源阈值（保留）
+15:0	group_efb_max	队列组EFB最大可用共享缓存资源阈值
+
+长字1
+31:29	reserve	保留
+28:16	group_ifb_cong	队列组拥塞门限（保留）
+15:0	group_efb_cong	队列组拥塞门限
+长字2
+31:29	reserved	保留
+28:16	chip_drop_group_i fb	芯片拥塞的队列组丢弃门限。即芯片占共享缓存超过此阈值时，丢弃相应队列组的报文。（保留）
+15:0	 chip_drop_group_efb	芯片拥塞的队列组丢弃门限。即芯片占共享缓存超过此阈值时，丢弃相应队列组的报文。
+长字3
+31:22	reserve	保留
+21:0	group_16b_max	组最大门限（16B）
+长字4
+31:22	reserve	保留
+21:0	group_16b_cong	组拥塞门限（16B）
+长字5
+31:22	reserve	保留
+21:0	 chip_drop_group_16b	芯片拥塞的队列组丢弃门限。即芯片占共享缓存超过此阈值时，丢弃相应队列组的报文（16B）
+Table 1.1 8  QGA Table数据结构
+
+1.1.5.13	QLS
+队列链表状态表项规格为256x160
+维护:由逻辑维护，CPU只读。
+QLS Table Specification
+表格名称	QLS Table
+起始地址	N/A
+地址范围	N/A
+表项数目	SD5182H：256 
+每项宽度	32bits×5Word
+ECC/PARITY	N/A
+寻址方式	索引方式为实体队列号
+Table 1.1 9 QLS Table表基本描述
+
+QLS Table Structure
+      Bit	Field	 Description
+长字0
+31:16	q_head	队列头指针 
+15:0	q_tail	队列尾指针
+长字1
+ 31	q_tail_drop_st	队列是否处于尾丢弃状态。(CELL,PKT)
+ 30	q_byte_drop_st	     队列是否处于尾丢弃状态(BYTE)
+29:20	q_pri_cnt	   队列的私有空间计数统计(CELL,PKT)
+19:14	Reserve	保留
+ 13:0	q_head_depth	当前需调度出队的包长度
+长字2
+31:0	Reserve	保留
+长字3
+31:16	q_efb_cell_num	实体队列占用块的数目
+15:0	q_efb_pkt_num	实体队列占用报文的数目
+长字4
+31:22	q_byte_pri_cnt	   队列的私有空间计数统计(16BYTE)
+21:0	q_16b_cnt	实体队列占用BYTE 的数目
+Table 1.1 10队列链表状态表QLS数据结构
+1.1.5.14	QDC
+队列丢弃和出队统计表，规格为209x160维护:逻辑统计，CPU读清零。
+QDC Table Specification
+表格名称	QDC Table
+起始地址	N/A
+地址范围	N/A
+表项数目	5182H：256 
+每项宽度	32bits×5Word
+ECC/PARITY/NO	N/A
+寻址方式	索引方式为实体队列号
+Table 1.1 11 QDC Table表基本描述
+
+QDC Table Structure
+      Bit	Field	 Description
+长字0
+31:0	tail_drop_pkt	因入队决策为尾丢的报文数目。统计条件为：
+(q_cnt > q_max) || (group_cnt > group_max)  || ((share_cnt > share_max)(如果还有private该队列能继续入队)) || (share_cnt > group_chip_share_max )|| ((chip_cnt >chip_max(包含私有和共享）);
+长字1
+31:0	      cong_drop_pkt	因入队决策为拥塞丢弃的报文数目。统计条件为：（q_cnt >q_cong）&& (g_cnt > g_cong) && (chip_cnt > chip_cong)
+长字2
+31:0	reserved	保留。
+                                                                        长字3
+31:0	       out_pkt(低32bit)	调度器调度出队的报文数目，如果队列送到EPS，则是该队列送到EPS得数目，如果是二次入队的队列，则是该队列送到环回端口的数目
+                                                               长字4
+31:4	Reserve	保留。
+3:0	       out_pkt（高4bit）	调度器调度出队的报文数目，如果队列送到EPS，则是该队列送到EPS得数目，如果是二次入队的队列，则是该队列送到环回端口的数目
+Table 1.1 12队列丢弃统计表QDC数据结构
+1.1.5.15	QDC_BYTE
+QDC_BYTE Table Specification
+表格名称	QDC  BYTE Table
+起始地址	N/A
+地址范围	N/A
+表项数目	256
+每项宽度	32bits×5Word
+ECC/PARITY/NO	N/A
+寻址方式	索引方式为实体队列号
+Table 1.1 13 QDC BYTE Table表基本描述
+
+QDC_BYTE Table Structure
+      Bit	Field	 Description
+长字0
+31:0	tail_drop_byte	因入队决策为尾丢的报文数目。统计条件为：
+(q_cnt > q_max) || (group_cnt > group_max)  || ((share_cnt > share_max)(如果还有private该队列能继续入队)) || (share_cnt > group_chip_share_max )|| ((chip_cnt >chip_max(包含私有和共享）);
+长字1
+31:0	      cong_drop_byte	因入队决策为拥塞丢弃的报文数目。统计条件为：（q_cnt >q_cong）&& (g_cnt > g_cong) && (chip_cnt > chip_cong)
+长字2
+31:0	reserved	保留。
+                                                                        长字3
+31:0	       out_pkt_byte(低32bit)	调度器调度出队的报文数目，如果队列送到EPS，则是该队列送到EPS得数目，如果是二次入队的队列，则是该队列送到环回端口的数目
+                                                               长字4
+31:4	Reserve	保留。
+3:0	       Out_pkt_byte（高4bit）	调度器调度出队的报文数目，如果队列送到EPS，则是该队列送到EPS得数目，如果是二次入队的队列，则是该队列送到环回端口的数目
+                                                                  长字5
+31:0	       q_store_byte(低32bit)	队列里缓存的报文字节统计
+Table 1.1 14队列丢弃统计表QDC_BYTE数据结构
+
+1.1.5.16	GSSA 
+通用调度器调度属性表,表项规格为64x96维护:由CPU维护。
+注意：用户级业务调度器和端口级业务调度器仅有4个输入，只需要配置输入端0~输入端3；而用户调度器有16个输入端，十六个输入端都需要配置；
+GSSA Table Specification
+表格名称	GSSA Table
+起始地址	N/A
+地址范围	N/A
+表项数目	5182H：48
+每项宽度	32bits×3Word
+ECC/PARITY/NO	N/A
+寻址方式	索引方式为通用调度器编号
+Table 1.1 15 GSSA Table表基本描述
+
+GSSATable Structure
+      Bit	Field	 Description
+长字0
+31:18	Reserve	保留
+ 17:16	                    specific_sch_sel	2’b00: 不是使用特定的调度算法，调度使用方式跟16H一样，是普通的WRR、SP调度；
+2’b01：保留；
+2’b10：共享带宽调度；
+2’b11：带权重的SP调度；
+注意：此域为5182H/5182新增，应用在WRR共享权重调度和带WSP调度。
+15:8	Reserve	保留
+7:0	eqm_chid	逻辑端口号。具体含义见EQM_CHID表的解释
+长字1
+31:24	Reserve	保留
+23:21	input7_gnum	输入端的优先级属性，0最高，7最低
+20:18	input6_gnum	输入端的优先级属性，0最高，7最低
+17:15	input5_gnum	输入端的优先级属性，0最高，7最低
+14:12	input4_gnum	输入端的优先级属性，0最高，7最低
+11:9	input3_gnum	输入端的优先级属性，0最高，7最低
+8:6	input2_gnum	输入端的优先级属性，0最高，7最低
+5:3	input1_gnum	输入端的优先级属性，0最高，7最低
+2:0	input0_gnum	输入端的优先级属性，0最高，7最低
+长字2
+31:24	Rsv	保留
+23:21	input15_gnum	输入端的优先级属性，0最高，7最低
+20:18	input14_gnum	输入端的优先级属性，0最高，7最低
+17:15	input13_gnum	输入端的优先级属性，0最高，7最低
+14:12	input12_gnum	输入端的优先级属性，0最高，7最低
+11:9	input11_gnum	输入端的优先级属性，0最高，7最低
+8:6	input10_gnum	输入端的优先级属性，0最高，7最低
+5:3	input9_gnum	输入端的优先级属性，0最高，7最低
+2:0	input8_gnum	输入端的优先级属性，0最高，7最低
+Table 1.1 16通用调度器调度属性表GSSA数据结构
+
+1.1.5.17	QSL
+队列调度器连接关系表,表项规格为(256+48) x32， 
+维护:由CPU初始化，逻辑维护。
+QSL Table Specification
+表格名称	QSL Table
+起始地址	N/A
+地址范围	N/A
+表项数目	SD5182H : 256+48
+每项宽度	32bits×1Word
+ECC/PARITY/NO	ECC
+寻址方式	索引方式为输入端，即：
+队列作为输入端，索引为{队列号}；
+通用调度器作为输入端，索引为{队列总数目+通用调度器编号}；
+
+Table 1.1 17  QSL Table表基本描述
+
+QSLTable Structure
+队列调度器连接关系表QSL数据结构
+      Bit	Field	 Description
+长字0
+31:19	Reserve	保留
+18	vp_use	有没有跟调度器的输入端相连
+0:没有跟调度器的输入端相连
+1:已经跟调度器的输入端相连
+17:14	vp_num	对应通用调度器的第几个输入端，取值为0~15。
+仅在父调度器为通用调度器有效。
+13	sch_logic	父调度器输出是否跟逻辑通道相连
+12:6	reserve	保留
+5:0	sch_num	对应的通用调度器ID。
+Table 1.1 18  QSL Table表基本描述
+
+STS Table
+调度器令牌状态表,表项规格为(256+48)*32维护:由CPU初始化，逻辑维护。
+STS Table Specification
+表格名称	STS Table
+起始地址	N/A
+地址范围	N/A
+表项数目	SD5182H：256+48
+每项宽度	32bits×2Word
+ECC/PARITY/NO	N/A
+寻址方式	索引方式为调度器的输入端，可能为队列、通用调度器的输出。
+队列输出作为输入端，索引为{队列号}，每行存一个队列输出的配置。队列只能连到通用调度器的输入端。
+通用调度器的输出作为输入端，索引为{Q_NUM+通用调度器编号}，每行存一个调度器输出的配置。 
+
+Table 1.1 19 STS Table表基本描述
+
+STS Table Structure
+Bit	Field	Description
+长字0
+ 31:26	reserve	保留
+25:24	Wgt_unit_sel	DRR调度算法情况下，单位权重代表的令牌数。
+00:2K；
+            01:4K；
+            10:8K；
+            11:16K;
+
+23:16	Pir_wgt	PIR的调度权重。最大为255。（CPU配置）
+WRR调度算法下：1个单位代表一个包 ；
+DRR调度算法下：1个单位代表2048byte;
+15	schedule_sel 	0:WRR 1:DRR
+ 14:9	reserved	保留
+8	pir_tk_borr_st_wrr/drr_pir_token[8]	WRR情况下，令牌预借标志0：没有处于预借状态 1：处于预借状态；    DRR情况下，令牌统计的第8bit；
+7:0	Wrr_Pir_token/Drr_pir_token[7:0]	PIR的调度令牌。（逻辑更新,WRR情况下的令牌统计，DRR情况下令牌统计的低8bit）
+                                长字1
+31:15	reserved	保留
+14	pir_tk_borr_st_drr	DRR情况下是否已经处于预借令牌状态（逻辑更新）
+0:没有处于预借令牌状态
+1:已经处于预借令牌状态
+13:0	Drr_pir_token[22:9]	DRR_PIR的调度令牌高14bit。（逻辑更新）
+Table 1.1 20调度器令牌状态表STS数据结构
+
+1.1.5.18	GSMA
+表项规格为(48*16)*32，逻辑维护，CPU可读。
+GSMA Table Specification
+表格名称	GSMA Table
+起始地址	N/A
+地址范围	N/A
+表项数目	SD5182H： 48×16
+每项宽度	32bits×1Word
+ECC/PARITY/NO	ECC
+寻址方式	索引方式为{通用调度器编号, 调度器输入端编号}，每个调度器保留16个输入端的配置。
+Table 1.1 21  GSMA Table表基本描述
+
+GSMA Table Structure
+
+通用调度器成员属性表GSMA数据结构
+Bit	Field	Description
+长字0
+31:16	reserve	保留
+15	Val	该调度器的输入端是否被占用
+0: 没有给占用
+1: 已经给占用
+14	vp_sch	调度器的输入端为子调度器的输出或者实体队列。为1表示为子调度器的输出；为0表示实体队列直接连到本调度器的输入端。
+13:8	reserve	保留
+7:0	q_num	如果对应的是实体队列，q_num[7:0]表示256个实体队列号；
+如果对应的是子调度器的输出，则
+q_num[5:0]表示子调度器的ID；
+Table 1.1 22  GSMA Table数据结构
+
+1.1.5.19	SHT
+表项规格为48*64。
+维护:由CPU维护，逻辑只读。
+SHT Table Specification
+表格名称	SHT Table
+起始地址	N/A
+地址范围	N/A
+表项数目	48
+每项宽度	32bits×2Word
+ECC/PARITY/NO	N/A 
+寻址方式	索引方式为SHAPER模板号，存储SHAPER模板配置。
+Table 1.1 23 SHT Table表基本描述
+
+SHT Table Structure
+Bit	Field	Description
+长字0
+31:25	reserve	保留
+    24	Shape_mode	0:BPS模式，1：PPS模式 （这个bit只给软件使用，逻辑不用，用来标识当前模板是BPS模板还是PPS模板；队列、通用调度器、端口调度器SHAPER采用哪种模式看QSCT、SSCT、PSCT的模式配置）
+23:20	reserve	保留
+19:0	XIR	1:队列与通用调度器的shape配置，单位为16Kbps，支持的速率范围为:0～10Gbps（例如带宽1.6Mbps，需要配置CIR=1.6Mbps/16Kbps=100），支持QSCT,SSCT，刷新周期为125US。
+2:端口调度器的shape模板配置,单位为1Mbps，支持PSCT，刷新周期为8US;如带宽为1G,则配置为1000M/1M=1000;
+3：队列和通用调度器情况下，如果对应PPS模式的模板，则XIR值对应所需要的PPS。如配置为5，则为5PPS。
+4：端口调度器情况下，XIR值即为PPS值；
+长字1
+31:24	reserve	保留
+23:0	XBS	1：队列和通用调度器情况BPS下：支持的突发度，单位为1byte，支持的突发范围为0~16Mbyte。建议配置值为：
+CBS0 > 2*MTU（最大包长）;
+CBS1 > xir*16k*125US（当前的刷新时间）/8(byte);
+取CBS0和CBS1中的最大的一个配置对应SHAPE模板的CBS。
+2：队列和通用调度器在PPS情况下：
+ CBSP0 == n*2000, n>=2
+ CBSP1 == ((xir*16k*125US（当前刷新时间）/8（byte）)/2000) ↑（上取整）*2000.
+ 取CBSP0和CBSP1的最大值配置。
+3：端口调度器BPS情况下：
+CBS0 > 2*MTU（最大包长）;
+CBS1 > xir*1Mbit*8US（当前的刷新时间）/8(byte);
+取CBS0和CBS1中的最大的一个配置对应SHAPE模板的CBS。
+4:端口调度器PPS情况下：
+CBS0 == n * 125000byte n>=2;
+CBS1 > （xir*1Mbit*8US（当前的刷新时间）/8(byte);
+取CBS0和CBS1中的最大的一个配置对应SHAPE模板的CBS。
+Table 1.1 24 SHT Table数据结构
+
+1.1.5.20	QSCT
+队列输出的SHAPER配置及令牌状态表，规格为256*64维护:由CPU初始化令牌和模板选择，逻辑维护令牌数，刷新周期125US。
+QSCT  Table Specification
+表格名称	QSCT Table
+起始地址	N/A
+地址范围	N/A
+表项数目	SD5182H：256
+每项宽度	32bits×2Word
+ECC/PARITY/NO	N/A
+寻址方式	索引方式为{队列号},每行存一个队列的SHAPER配置及状态。基于队列的SHAPER只支持PIR相关配置及状态。
+Table 1.1 25  QSCT Table表基本描述
+
+QSCT Table Structure
+Bit	Field	Description
+长字0
+31:17	reserve	保留
+16	qshp_mode	队列的SHAPE模式0：BPS，1：PPS
+15:8	qshp_adj	Shaper的帧长修正因子（有符号数-128-127），软件应该配置修正因子的补码（CPU配置）。
+7:6	reserve	保留
+5:0	pir_shp_mnum	PIR SHAPER对应的模板选择。支持32个模板。0模板表示不受shaper限制（CPU配置）。
+长字1
+31:25	reserve	保留
+24	pir_shp_borr_st	PIR SHAPER是否已经处于预借令牌状态（CPU初始化，逻辑更新）
+0:没有处于预借令牌状态
+1:已经处于预借令牌状态
+23:0	pir_tk_byte	PIR SHAPER令牌数，单位为Byte（CPU初始化，逻辑更新）
+注：当速率动态切换时，软件需要延迟1ms左右再把该令牌桶pir_tk_byte和pir_shp_borr_st清零。
+Table 1.1 26 shaper令牌统计表QSCT数据结构
+1.1.5.21	SSCT
+调度器输出的SHAPER配置及令牌状态表，规格为48*64，
+维护:由CPU初始化令牌和模板选择，逻辑维护令牌数，刷新周期125US。
+SSCT Table Specification
+表格名称	SSCT Table
+起始地址	N/A
+地址范围	N/A
+表项数目	SD5182H：48
+每项宽度	32bits×2Word
+ECC/PARITY/NO	N/A
+寻址方式	通用调度器输出的SHAPER，索引为{通用调度器编号},每行存一个通用调度器的SHAPER配置及状态。基于通用调度器的SHAPER只支持PIR相关配置及状态。
+
+Table 1.1 27 SSCT Table表基本描述
+
+SSCT Table Structure
+Bit	Field	Description
+长字0
+31:9	reserve	保留
+8	Sshp_mode	通用调度器的SHAPE模式，0：BPS，1：PPS
+7:6	reserve	保留
+5:0	pir_shp_mnum	PIR SHAPER对应的模板选择。支持64个模板。0模板表示不受shaper限制（CPU配置）
+长字1
+31:25	reserve	保留
+24	pir_shp_borr_st	PIR SHAPER是否已经处于预借令牌状态（CPU初始化，逻辑更新）
+0:没有处于预借令牌状态
+1:已经处于预借令牌状态
+23:0	pir_tk_byte	PIR SHAPER令牌数，单位为Byte（CPU初始化，逻辑更新）
+注：当速率动态切换时，软件需要延迟1ms左右再把该令牌桶pir_tk_byte和pir_shp_borr_st清零。
+Table 1.1 28 shaper令牌统计表SSCT数据结构
+
+1.1.5.22	PSCT
+基于端口调度器的SHAPER配置及令牌状态表，规格为4*64维护:由CPU初始化模板选择，逻辑维护令牌数，刷新周期8US。
+PSCT Table Specification
+表格名称	PSCT Table
+起始地址	N/A
+地址范围	N/A
+表项数目	4
+每项宽度	32bits×2Word
+ECC/PARITY/NO	N/A
+寻址方式	索引方式为端口调度器编号
+Table 1.1 29 PSCT Table表基本描述
+
+PSCT Table Structure
+Bit	Field	Description
+长字0
+31:9	reserve	保留
+8	Pshp_mode	端口调度器SHP模式，0：BPS，1：PPS
+7:6	reserve	保留
+5:0	pir_shp_mnum	PIR SHAPER对应的模板选择。支持48个模板。0模板表示不受shaper限制（CPU配置）
+长字1
+31:25	reserve	保留
+24	pir_shp_borr_st	PIR SHAPER是否已经处于预借令牌状态（CPU初始化，逻辑更新）
+0:没有处于预借令牌状态
+1:已经处于预借令牌状态
+23:0	pir_tk_byte	PIR SHAPER令牌数，单位为Byte（CPU初始化，逻辑更新）
+注：当速率动态切换时，软件需要延迟1ms左右再把该令牌桶pir_tk_byte和pir_shp_borr_st清零。
+Table 1.1 30 shaper令牌统计表PSCT数据结构
+
+1.1.5.23	BWT
+表项规格为72*64。
+维护:由CPU维护，逻辑只读。
+BWT Table Specification
+表格名称	BWT Table
+注：带宽配置表，仅用在5182的SmartQos共享带宽特性,仅调度器0~7支持共享带宽特性，且使用该特性时，仅可以使用调度器的0~7个输入端。
+起始地址	N/A
+地址范围	N/A
+表项数目	8*8 +8 = 72
+每项宽度	32bits×2Word
+ECC/PARITY/NO	N/A 
+寻址方式	保证带宽：索引方式为{调度器编号，调度器输入端编号}；
+共享带宽：64+调度器编号。
+注：仅支持0~7号调度器。
+Table 1.1 31 BWT Table表基本描述
+
+BWT Table Structure
+Bit	Field	Description
+长字0
+31:25	reserve	保留
+    24	bw_ctrl_en	0:关闭，1：打开  
+注意：使用共享带宽调度时需要配置成1。
+23:20	reserve	保留
+19:0	XIR	通用调度器的带宽配置项，单位为16Kbps，支持的速率范围为:0～10Gbps（例如带宽1.6Mbps，需要配置CIR=1.6Mbps/16Kbps=100），刷新周期默认为125US。
+长字1
+31:24	reserve	保留
+23:0	XBS	1：支持的突发大小，单位为1byte，支持的突发范围为0~16Mbyte。建议配置值为：
+XBS0 > 2*MTU（最大包长）;
+XBS1 > xir*16k*125US（当前的刷新时间）/8(byte);
+取XBS0和XBS1中的最大的一个配置对应SHAPE模板的XBS。
+
+Table 1.1 32  调度器带宽配置表BWT 数据结构
+
+1.1.5.24	STK
+调度器带宽配置及令牌状态表，规格为72*64，
+维护:由CPU初始化令牌和模板选择，逻辑维护令牌数，刷新周期125US。
+STK Table Specification
+表格名称	STK Table
+注：令牌状态表，仅用在5182的SmartQos共享带宽特性
+不支持动态配置。
+起始地址	N/A
+地址范围	N/A
+表项数目	8*8+8 = 136
+每项宽度	32bits×2Word
+ECC/PARITY/NO	N/A
+寻址方式	保证带宽：索引方式为{调度器编号，调度器输入端编号}；
+共享带宽：64+调度器编号。
+注：仅支持0~7号调度器。
+Table 1.1 33 STK Table表基本描述
+
+STK Table Structure
+Bit	Field	Description
+长字0
+31:17	reserve	保留
+16	bw_mode	队列的SHAPE模式0：BPS，1：PPS
+15:0	reserve	保留
+长字1
+31:25	reserve	保留
+24	pir_bw_borr_st	是否已经处于预借令牌状态（CPU初始化，逻辑更新）
+0:没有处于预借令牌状态
+1:已经处于预借令牌状态
+23:0	pir_bw_tk_byte	令牌数，单位为Byte（CPU初始化，逻辑更新）
+注：当速率动态切换时，软件需要延迟1ms左右再把该令牌桶pir_bw_tk_byte和pir_bw_borr_st清零。
+Table 1.1 34 带宽令牌统计表STK 数据结构
+
+1.1.5.25	FST
+业务流统计表，规格为256*80，
+维护:CPU可访问，逻辑维护。
+FST Table Specification
+表格名称	业务流统计表。
+起始地址	N/A
+地址范围	N/A
+表项数目	256
+每项宽度	32bit*3WORD
+ECC/PARITY/NO	N/A
+寻址方式	索引方式为{NP 流IDX}；
+Table 1.1 35 FST Table表基本描述
+
+FST Table Structure
+Bit	Field	Description
+长字0
+31:0	flow_pkt_cnt	业务流报文个数统计
+长字1
+31:0	flow_byte_cnt	业务流报文字节数统计（低32bit）
+长字2
+31:16	reserved	保留
+15:0	flow_byte_cnt	业务流报文字节数统计
+Table 1.1 36 带宽令牌统计表FST 数据结构
+
+1.1.6	Walkthrough
+1.1.6.1	Packet Buffer Manager
+ 
+图表 2 PBM Block Diagram
+Packet Buffer Manager(PBM)主要完成队列管理功能。EQ模块完成入队管理，DEQ完成出队管理，PBM顶层模块完成SRAM的读写控制。具体如下：
+	入队丢弃判断处理流程如下：
+ 
+                                图表3 PBM入队丢弃判断
+ 
+
+图表4 PBM缓存管理丢弃决策
+
+	入队管理
+	接收从PE送过来的帧描述符，也需要接收二次入队的帧描述符。每8拍处理一个帧描述符；PE和二次入队之间采用RR轮询方式；
+	拥塞管理。包括进行WRED丢弃判断，独享共享队列资源管理处，队列尾丢弃管理。如果前级模块决策为丢弃，或者拥塞管理认为要丢弃的报文，需要进丢弃队列。
+	队列操作。包括更新队列头尾指针和深度，空闲队列头尾指针。
+	入队指示信号：需要向调度模块送出入队信号，把当前队列的队列头信息送给调度模块。
+	入队操作需要两个流水周期，每个流水周期为8个时钟周期。
+	出队管理
+	接收调度模块的出队信号，每8拍一个，然后把相应的帧描述按接口时序送给后面各个模块。
+	队列操作。包括更新队列头尾指针和深度，空闲队列头尾指针。
+	实现采用二级流水，每级流水周期为8个时钟周期。第一个流水完成队列状态更新，第二个流水完成帧描述子信息的读取及送到后面接口模块。
+	设计细节
+	因为入队操作和出队操作有可能同时发生，并且是对同一个队列的，更新队头队尾指针时需要注意互相影响。
+	入队操作对空队列和非空队列操作不一样。对空队列，需要同时更新队头和队尾指针，对非空队列只需要更新队尾指针即可。
+	调度补偿在PBM中隔离了。即QS完成基于PBM送来的FD进行调度，令牌更新等，也是PBM送过来的。PBM开始送的帧长是精准帧长，直接送入QS进行调度。
+1.1.6.2	Queue Schedule
+1.1.6.2.1	Queue Schedule Diagram
+
+ 
+图表 5 QS Block Diagram
+QueueSchedule(QS)主要完成队列调度功能。Schedule是核心模块，完成调度的具体功能。shaper完成基于队列的shaper和基于调度器的shaper的令牌维护功能。Scheduler顶层模块完成内部表项的读写控制。具体如下：
+	Schedule
+	接收CPU维护调度器拓扑结构命令，完成调度器拓扑结构的建立和删除。
+	接收PBM的入队信息，更新各个调度器输入端信息。
+	根据shaper的令牌，维护各个调度器输入端信息。
+	接收并维护EPS的反压信息。
+	根据调度器输入端信息和反压信息，采用拉的实现方法，完成三级业务调度和一级电路调度。
+	Shaper
+	维护基于流队列的shaper和基于调度器的shaper令牌。
+	根据握手信号送出各个调度器的状态。
+
